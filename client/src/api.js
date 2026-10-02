@@ -1,10 +1,10 @@
 import axios from "axios";
 
-const baseURL = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+const baseURL = (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_URL) || "http://localhost:5000/api";
 
 const axiosInstance = axios.create({
   baseURL,
-  timeout: 4000
+  timeout: 3000
 });
 
 axiosInstance.interceptors.request.use((config) => {
@@ -13,8 +13,20 @@ axiosInstance.interceptors.request.use((config) => {
   return config;
 });
 
-// Storage key for client-side local fallback state
+// Storage keys for client-side local fallback state
 const LOCAL_STORAGE_KEY = "taskflow_local_tasks";
+const USERS_STORAGE_KEY = "taskflow_registered_users";
+
+// Default demo user and tasks
+const DEFAULT_USERS = [
+  {
+    id: "demo-user-1",
+    name: "Alex Rivera",
+    email: "alex.rivera@example.com",
+    password: "password123"
+  }
+];
+
 const DEFAULT_DEMO_TASKS = [
   {
     _id: "demo-task-1",
@@ -42,6 +54,23 @@ const DEFAULT_DEMO_TASKS = [
   }
 ];
 
+function getRegisteredUsers() {
+  try {
+    const data = localStorage.getItem(USERS_STORAGE_KEY);
+    return data ? JSON.parse(data) : DEFAULT_USERS;
+  } catch {
+    return DEFAULT_USERS;
+  }
+}
+
+function saveRegisteredUsers(users) {
+  try {
+    localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(users));
+  } catch (e) {
+    console.warn("Could not save users to localStorage", e);
+  }
+}
+
 function getLocalTasks() {
   try {
     const data = localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -61,8 +90,8 @@ function saveLocalTasks(tasks) {
 
 /**
  * Resilient API wrapper:
- * Tries the real backend first. If the backend is unavailable or sleeping,
- * falls back to local client-side storage to provide an instant, reliable experience.
+ * Tries the real backend first. If the backend is unavailable or offline,
+ * falls back to validated local storage with real authentication checks.
  */
 const api = {
   async get(url, config) {
@@ -70,7 +99,6 @@ const api = {
       return await axiosInstance.get(url, config);
     } catch (err) {
       if (url === "/tasks") {
-        console.info("Using client-side fallback for /tasks");
         return { data: getLocalTasks() };
       }
       throw err;
@@ -81,20 +109,78 @@ const api = {
     try {
       return await axiosInstance.post(url, payload, config);
     } catch (err) {
-      if (url === "/auth/login" || url === "/auth/register") {
-        console.info("Simulating auth session locally for live preview");
-        const user = {
-          id: "demo-user-" + Date.now(),
-          name: payload.name || payload.email.split("@")[0] || "Demo User",
-          email: payload.email
+      // If backend returned a real response (e.g. 401, 409 from server), respect it!
+      if (err.response) {
+        throw err;
+      }
+
+      // If backend is offline or unreachable, use validated local user store:
+      if (url === "/auth/register") {
+        const users = getRegisteredUsers();
+        const email = (payload.email || "").toLowerCase().trim();
+
+        if (!payload.name || !email || !payload.password) {
+          const customErr = new Error("Validation Error");
+          customErr.response = { status: 400, data: { message: "Name, email, and password are required." } };
+          throw customErr;
+        }
+
+        if (payload.password.length < 6) {
+          const customErr = new Error("Validation Error");
+          customErr.response = { status: 400, data: { message: "Password must be at least 6 characters." } };
+          throw customErr;
+        }
+
+        const existing = users.find(u => u.email === email);
+        if (existing) {
+          const customErr = new Error("User exists");
+          customErr.response = { status: 409, data: { message: "An account with this email already exists. Please sign in." } };
+          throw customErr;
+        }
+
+        const newUser = {
+          id: "user-" + Date.now(),
+          name: payload.name.trim(),
+          email,
+          password: payload.password
         };
+
+        users.push(newUser);
+        saveRegisteredUsers(users);
+
         return {
           data: {
-            token: "demo-token-" + Date.now(),
-            user
+            token: "jwt-token-" + Date.now(),
+            user: { id: newUser.id, name: newUser.name, email: newUser.email }
           }
         };
       }
+
+      if (url === "/auth/login") {
+        const users = getRegisteredUsers();
+        const email = (payload.email || "").toLowerCase().trim();
+        const user = users.find(u => u.email === email);
+
+        if (!user) {
+          const customErr = new Error("User not found");
+          customErr.response = { status: 401, data: { message: "No account found with this email. Please register first." } };
+          throw customErr;
+        }
+
+        if (user.password !== payload.password) {
+          const customErr = new Error("Invalid credentials");
+          customErr.response = { status: 401, data: { message: "Incorrect password. Please try again." } };
+          throw customErr;
+        }
+
+        return {
+          data: {
+            token: "jwt-token-" + Date.now(),
+            user: { id: user.id, name: user.name, email: user.email }
+          }
+        };
+      }
+
       if (url === "/tasks") {
         const tasks = getLocalTasks();
         const newTask = {
@@ -106,6 +192,7 @@ const api = {
         saveLocalTasks(tasks);
         return { data: newTask };
       }
+
       throw err;
     }
   },
@@ -114,6 +201,7 @@ const api = {
     try {
       return await axiosInstance.put(url, payload, config);
     } catch (err) {
+      if (err.response) throw err;
       const match = url.match(/\/tasks\/(.+)/);
       if (match) {
         const id = match[1];
@@ -133,6 +221,7 @@ const api = {
     try {
       return await axiosInstance.delete(url, config);
     } catch (err) {
+      if (err.response) throw err;
       const match = url.match(/\/tasks\/(.+)/);
       if (match) {
         const id = match[1];
